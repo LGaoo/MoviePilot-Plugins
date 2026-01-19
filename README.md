@@ -1,2 +1,2 @@
 # MoviePilot-Plugins
-MoviePilot插件库-
+MoviePilot插件库
