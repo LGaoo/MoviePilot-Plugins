@@ -22,7 +22,7 @@ lock = threading.Lock()
 
 class FileCopy(_PluginBase):
     # 插件元信息
-    plugin_name = "文件复制"
+    plugin_name = "文件复制-V1"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
     plugin_version = "1.4"
