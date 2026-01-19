@@ -1,12 +1,12 @@
 {
-	"FileCopy": {
-	    "name": "文件复制",
+    "FileCopy": {
+        "name": "文件复制",
 	    "description": "自定义文件类型从源目录复制到目的目录。",
 	    "labels": "工具",
 	    "version": "1.0",
-	    "icon": "copy_files.png",
+	    "icon": "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png",
 	    "author": "LGaoo",
 	    "level": 1,
 	    "v2": true
-	}
+    }
 }
