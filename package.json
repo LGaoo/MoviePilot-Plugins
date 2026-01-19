@@ -1,6 +1,6 @@
 {
     "FileCopy": {
-        "name": "文件复制",
+        "name": "文件复制V1",
 	    "description": "自定义文件类型从源目录复制到目的目录。",
 	    "labels": "工具",
 	    "version": "1.0",
