@@ -20,15 +20,15 @@ from app.schemas.types import NotificationType  # 用于发送通知
 lock = threading.Lock()
 
 
-class FileCopy(_PluginBase):
+class FileCopy2(_PluginBase):
     # 插件元信息
-    plugin_name = "文件复制-V1"
+    plugin_name = "文件复制（完善版）"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.4"
+    plugin_version = "1.0"
     plugin_author = "LGaoo"
     author_url = "https://github.com/LGaoo"
-    plugin_config_prefix = "filecopy_"
+    plugin_config_prefix = "filecopy2_"
     plugin_order = 30
     auth_level = 1
 
