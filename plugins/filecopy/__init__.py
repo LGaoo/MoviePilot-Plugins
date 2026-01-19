@@ -24,10 +24,10 @@ class FileCopy(_PluginBase):
     # 插件元信息
     plugin_name = "文件复制"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
-    plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.3"
-    plugin_author = "thsrite"
-    author_url = "https://github.com/thsrite"
+    plugin_icon = "https://github.com/LGaoo/MoviePilot-Plugins/blob/main/icons/copy_files.png"
+    plugin_version = "1.4"
+    plugin_author = "LGaoo"
+    author_url = "https://github.com/LGaoo"
     plugin_config_prefix = "filecopy_"
     plugin_order = 30
     auth_level = 1
