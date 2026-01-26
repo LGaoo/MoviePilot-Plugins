@@ -25,7 +25,7 @@ class FileCopy(_PluginBase):
     plugin_name = "文件复制"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.4"
+    plugin_version = "1.1"
     plugin_author = "thsrite"
     author_url = "https://github.com/thsrite"
     plugin_config_prefix = "filecopy_"
