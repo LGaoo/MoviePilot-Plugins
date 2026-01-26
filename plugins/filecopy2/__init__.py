@@ -15,20 +15,20 @@ from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.system import SystemUtils
-from app.schemas.types import NotificationType
+from app.schemas.types import NotificationType  # 用于发送通知
 
 lock = threading.Lock()
 
 
-class FileCopy(_PluginBase):
+class FileCopy2(_PluginBase):
     # 插件元信息
-    plugin_name = "文件复制"
+    plugin_name = "文件复制（完善版）"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
-    plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.1"
-    plugin_author = "thsrite"
-    author_url = "https://github.com/thsrite"
-    plugin_config_prefix = "filecopy_"
+    plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
+    plugin_version = "1.2"
+    plugin_author = "LGaoo"
+    author_url = "https://github.com/LGaoo"
+    plugin_config_prefix = "filecopy2_"
     plugin_order = 30
     auth_level = 1
 
@@ -44,10 +44,10 @@ class FileCopy(_PluginBase):
 
     _rmt_mediaext = None
 
-    # 新增选项
-    _notify = True            # 默认发送通知
-    _delete_source = False    # 默认不删除源文件
-    _preserve_dirs = False    # 默认不保留子目录（平铺到目标目录）
+    # 新增：是否发送通知（默认 True），是否删除源文件（默认 False），是否保留子目录（默认 False）
+    _notify = True
+    _delete_source = False
+    _preserve_dirs = False
 
     _event = threading.Event()
 
@@ -55,7 +55,7 @@ class FileCopy(_PluginBase):
         # 清空配置
         self._dirconf = {}
 
-        # 读取配置（与原版一致，并读取新选项）
+        # 读取配置（与原版一致，并读取 notify、delete、preserve_dirs）
         if config:
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
@@ -63,7 +63,7 @@ class FileCopy(_PluginBase):
             self._cron = config.get("cron")
             self._delay = config.get("delay")
             self._rmt_mediaext = config.get("rmt_mediaext") or ".nfo, .jpg"
-            # 新增配置项读取（保留默认）
+            # 新增配置项读取
             self._notify = config.get("notify") if config.get("notify") is not None else True
             self._delete_source = config.get("delete") if config.get("delete") is not None else False
             self._preserve_dirs = config.get("preserve_dirs") if config.get("preserve_dirs") is not None else False
@@ -84,7 +84,7 @@ class FileCopy(_PluginBase):
                 if not mon_path:
                     continue
 
-                # 存储目的目录（保留 Windows 兼容解析逻辑）
+                # 存储目的目录（保留原版 Windows 兼容解析逻辑）
                 if SystemUtils.is_windows():
                     if mon_path.count(":") > 1:
                         parts = mon_path.split(":")
@@ -128,7 +128,8 @@ class FileCopy(_PluginBase):
 
     def _verify_copy(self, src: Path, dst: Path) -> bool:
         """
-        通过存在与大小一致来判断复制是否成功
+        验证复制是否成功 —— 通过文件存在与大小一致来判断。
+        返回 True 表示复制成功。
         """
         try:
             if not dst.exists():
@@ -142,7 +143,7 @@ class FileCopy(_PluginBase):
 
     def _make_unique_dest(self, dest: Path) -> Path:
         """
-        若目标已存在且需避免覆盖，生成 name (1).ext 格式的唯一文件名
+        如果 dest 已存在，尝试生成 dest (1).ext, dest (2).ext ...
         """
         if not dest.exists():
             return dest
@@ -158,17 +159,12 @@ class FileCopy(_PluginBase):
 
     def copy_files(self):
         """
-        定时任务：拷贝文件
-        支持：
-          - 递归遍历（followlinks=True）
-          - 扁平化（不保留子目录）或保留子目录
-          - 复制后校验并回退到 shutil.copy2
-          - 可选删除源文件（复制成功后）
-          - 任务结束可选通知（summary）
+        定时任务，复制文件（稳定遍历 + 验证复制 + 可选删除源文件 + 可选发送通知）
+        默认行为：不保留子目录（平铺到目标根），可在配置中切换 preserve_dirs。
         """
-        logger.info("开始全量复制监控目录（含平铺/保留/删除/通知选项）...")
+        logger.info("开始全量复制监控目录（含通知与可选删除，preserve_dirs=%s）..." % str(self._preserve_dirs))
 
-        # 解析扩展名（标准化为小写并以.开头）
+        # 解析扩展名，规范为小写并以 '.' 开头
         exts = []
         if self._rmt_mediaext:
             try:
@@ -178,9 +174,10 @@ class FileCopy(_PluginBase):
                     exts.append(ext.lower())
             except Exception:
                 exts = []
+
         scan_all = len(exts) == 0
 
-        # 统计用于通知
+        # 统计（用于通知）
         total_found = 0
         total_copied = 0
         total_failed = 0
@@ -191,7 +188,7 @@ class FileCopy(_PluginBase):
         skipped_examples = []
         deleted_examples = []
 
-        # 遍历配置项
+        # 遍历配置
         for mon_path, target_path in list(self._dirconf.items()):
             if not mon_path:
                 continue
@@ -208,7 +205,7 @@ class FileCopy(_PluginBase):
 
             logger.info(f"扫描目录：{repr(str(src_base))}")
 
-            # 收集文件：使用 os.walk(followlinks=True)
+            # 使用 os.walk 递归并 followlinks=True 更稳定（网络挂载、symlink）
             files = []
             try:
                 dir_count = 0
@@ -259,7 +256,7 @@ class FileCopy(_PluginBase):
                         src_size = -1
                     logger.info(f"开始处理本地文件：{repr(str(file_path))} (大小: {src_size})")
 
-                    # 目标路径决定：保留子目录或平铺
+                    # 目标路径决定：保留子目录 or 平铺
                     if self._preserve_dirs:
                         try:
                             relative = file_path.relative_to(src_base)
@@ -268,6 +265,7 @@ class FileCopy(_PluginBase):
                             relative = Path(rel_str)
                         dest_file = tgt_base.joinpath(*relative.parts)
                     else:
+                        # 平铺：只保留文件名，放到目标目录根
                         dest_file = tgt_base.joinpath(file_path.name)
 
                     # 若目标已存在且一致，跳过
@@ -315,11 +313,13 @@ class FileCopy(_PluginBase):
                         if len(copied_examples) < 10:
                             copied_examples.append(str(dest_file))
                     else:
-                        logger.warning(f"SystemUtils.copy 失败或不可验证 ({copy_err})，回退到 shutil.copy2")
+                        # 回退到 shutil.copy2
+                        logger.warning(f"SystemUtils.copy 结果不可验证或失败 (info: {copy_err}), 回退到 shutil.copy2")
                         try:
                             shutil.copy2(str(file_path), str(dest_file))
                         except Exception as e:
                             logger.error(f"shutil.copy2 复制失败：{e}")
+                        # 再次验证
                         if self._verify_copy(file_path, dest_file):
                             logger.info(f"{repr(str(file_path))} -> {repr(str(dest_file))} 成功 (shutil.copy2 回退)")
                             total_copied += 1
@@ -342,7 +342,7 @@ class FileCopy(_PluginBase):
                             if len(failed_examples) < 10:
                                 failed_examples.append(f"{file_path} -> 最终失败 (src_size={src_size2}, dst_size={dst_size2})")
 
-                    # 若复制成功且开启删除源文件，则删除源文件
+                    # 如果复制已验证成功并且启用了删除源文件，则删除源文件
                     if copy_verified and self._delete_source:
                         try:
                             file_path.unlink()
@@ -352,10 +352,11 @@ class FileCopy(_PluginBase):
                             logger.info(f"已删除源文件：{repr(str(file_path))}")
                         except Exception as e:
                             logger.error(f"删除源文件失败：{file_path} -> {e}")
+                            # 未把删除失败计为复制失败，保留复制结果，但记录失败示例
                             if len(failed_examples) < 10:
                                 failed_examples.append(f"{file_path} -> 删除失败: {e}")
 
-                    # 随机/批量延时逻辑（按配置生效）
+                    # 随机/批量延时逻辑（保持原配置动态生效）
                     if self._delay:
                         try:
                             cnt += 1
@@ -410,6 +411,7 @@ class FileCopy(_PluginBase):
                     body_lines += deleted_examples[:10]
 
                 message = "\n".join(body_lines)
+                # 调用基类 post_message 发送通知
                 self.post_message(title=title, mtype=NotificationType.SiteMessage, text=message)
             except Exception as e:
                 logger.error(f"发送通知失败：{e}")
@@ -435,16 +437,17 @@ class FileCopy(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        return []
+        pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        pass
 
     def get_service(self) -> List[Dict[str, Any]]:
+        # 使用唯一 id 避免与旧版冲突
         if self._enabled and self._cron:
             return [{
-                "id": "FileCopy",
-                "name": "文件复制",
+                "id": "FileCopy2",
+                "name": "文件复制（完善版）",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.copy_files,
                 "kwargs": {}
@@ -595,7 +598,7 @@ class FileCopy(_PluginBase):
                                             'model': 'monitor_dirs',
                                             'label': '监控目录',
                                             'rows': 5,
-                                            'placeholder': '监控目录:转移目的目录，示例：\\n/pan2/下载/电影/:/pan2/快速上传115/电影/\\n/pan2/下载/电视剧/:/pan2/快速上传115/电视剧/'
+                                            'placeholder': '监控目录:转移目的目录'
                                         }
                                     }
                                 ]
