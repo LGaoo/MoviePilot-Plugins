@@ -15,20 +15,20 @@ from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.system import SystemUtils
-from app.schemas.types import NotificationType  # 用于发送通知
+from app.schemas.types import NotificationType
 
 lock = threading.Lock()
 
 
-class FileCopy2(_PluginBase):
+class FileCopy(_PluginBase):
     # 插件元信息
-    plugin_name = "文件复制（完善版）"
+    plugin_name = "文件复制"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
-    plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.0"
-    plugin_author = "LGaoo"
-    author_url = "https://github.com/LGaoo"
-    plugin_config_prefix = "filecopy2_"
+    plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/copy_files.png"
+    plugin_version = "1.4"
+    plugin_author = "thsrite"
+    author_url = "https://github.com/thsrite"
+    plugin_config_prefix = "filecopy_"
     plugin_order = 30
     auth_level = 1
 
@@ -44,9 +44,10 @@ class FileCopy2(_PluginBase):
 
     _rmt_mediaext = None
 
-    # 新增：是否发送通知（默认 True），是否删除源文件（默认 False）
-    _notify = True
-    _delete_source = False
+    # 新增选项
+    _notify = True            # 默认发送通知
+    _delete_source = False    # 默认不删除源文件
+    _preserve_dirs = False    # 默认不保留子目录（平铺到目标目录）
 
     _event = threading.Event()
 
@@ -54,7 +55,7 @@ class FileCopy2(_PluginBase):
         # 清空配置
         self._dirconf = {}
 
-        # 读取配置（与原版一致，并读取 notify 和 delete）
+        # 读取配置（与原版一致，并读取新选项）
         if config:
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
@@ -62,9 +63,10 @@ class FileCopy2(_PluginBase):
             self._cron = config.get("cron")
             self._delay = config.get("delay")
             self._rmt_mediaext = config.get("rmt_mediaext") or ".nfo, .jpg"
-            # 新增配置项读取
+            # 新增配置项读取（保留默认）
             self._notify = config.get("notify") if config.get("notify") is not None else True
             self._delete_source = config.get("delete") if config.get("delete") is not None else False
+            self._preserve_dirs = config.get("preserve_dirs") if config.get("preserve_dirs") is not None else False
 
         # 停止现有任务
         self.stop_service()
@@ -82,7 +84,7 @@ class FileCopy2(_PluginBase):
                 if not mon_path:
                     continue
 
-                # 存储目的目录（保留原版 Windows 兼容解析逻辑）
+                # 存储目的目录（保留 Windows 兼容解析逻辑）
                 if SystemUtils.is_windows():
                     if mon_path.count(":") > 1:
                         parts = mon_path.split(":")
@@ -126,8 +128,7 @@ class FileCopy2(_PluginBase):
 
     def _verify_copy(self, src: Path, dst: Path) -> bool:
         """
-        验证复制是否成功 —— 通过文件存在与大小一致来判断。
-        返回 True 表示复制成功。
+        通过存在与大小一致来判断复制是否成功
         """
         try:
             if not dst.exists():
@@ -139,13 +140,35 @@ class FileCopy2(_PluginBase):
             logger.error(f"验证复制失败：{e}")
             return False
 
+    def _make_unique_dest(self, dest: Path) -> Path:
+        """
+        若目标已存在且需避免覆盖，生成 name (1).ext 格式的唯一文件名
+        """
+        if not dest.exists():
+            return dest
+        parent = dest.parent
+        name = dest.stem
+        suffix = dest.suffix
+        i = 1
+        while True:
+            candidate = parent / f"{name} ({i}){suffix}"
+            if not candidate.exists():
+                return candidate
+            i += 1
+
     def copy_files(self):
         """
-        定时任务，复制文件（稳定遍历 + 验证复制 + 可选删除源文件 + 可选发送通知）
+        定时任务：拷贝文件
+        支持：
+          - 递归遍历（followlinks=True）
+          - 扁平化（不保留子目录）或保留子目录
+          - 复制后校验并回退到 shutil.copy2
+          - 可选删除源文件（复制成功后）
+          - 任务结束可选通知（summary）
         """
-        logger.info("开始全量复制监控目录（含通知与可选删除）...")
+        logger.info("开始全量复制监控目录（含平铺/保留/删除/通知选项）...")
 
-        # 解析扩展名，规范为小写并以 '.' 开头
+        # 解析扩展名（标准化为小写并以.开头）
         exts = []
         if self._rmt_mediaext:
             try:
@@ -155,10 +178,9 @@ class FileCopy2(_PluginBase):
                     exts.append(ext.lower())
             except Exception:
                 exts = []
-
         scan_all = len(exts) == 0
 
-        # 统计（用于通知）
+        # 统计用于通知
         total_found = 0
         total_copied = 0
         total_failed = 0
@@ -169,7 +191,7 @@ class FileCopy2(_PluginBase):
         skipped_examples = []
         deleted_examples = []
 
-        # 遍历配置
+        # 遍历配置项
         for mon_path, target_path in list(self._dirconf.items()):
             if not mon_path:
                 continue
@@ -186,7 +208,7 @@ class FileCopy2(_PluginBase):
 
             logger.info(f"扫描目录：{repr(str(src_base))}")
 
-            # 使用 os.walk 递归并 followlinks=True 更稳定（网络挂载、symlink）
+            # 收集文件：使用 os.walk(followlinks=True)
             files = []
             try:
                 dir_count = 0
@@ -237,16 +259,30 @@ class FileCopy2(_PluginBase):
                         src_size = -1
                     logger.info(f"开始处理本地文件：{repr(str(file_path))} (大小: {src_size})")
 
-                    # 计算相对路径
-                    try:
-                        relative = file_path.relative_to(src_base)
-                    except Exception:
-                        rel_str = os.path.relpath(str(file_path), start=str(src_base))
-                        relative = Path(rel_str)
+                    # 目标路径决定：保留子目录或平铺
+                    if self._preserve_dirs:
+                        try:
+                            relative = file_path.relative_to(src_base)
+                        except Exception:
+                            rel_str = os.path.relpath(str(file_path), start=str(src_base))
+                            relative = Path(rel_str)
+                        dest_file = tgt_base.joinpath(*relative.parts)
+                    else:
+                        dest_file = tgt_base.joinpath(file_path.name)
 
-                    dest_file = tgt_base.joinpath(*relative.parts)
+                    # 若目标已存在且一致，跳过
+                    if dest_file.exists() and self._verify_copy(file_path, dest_file):
+                        logger.info(f"{repr(str(dest_file))} 文件已存在且一致，跳过")
+                        total_skipped += 1
+                        if len(skipped_examples) < 10:
+                            skipped_examples.append(str(dest_file))
+                        continue
 
-                    # 确保父目录存在
+                    # 平铺模式下，若目标存在但大小不一致，生成唯一名字避免覆盖
+                    if not self._preserve_dirs and dest_file.exists() and not self._verify_copy(file_path, dest_file):
+                        dest_file = self._make_unique_dest(dest_file)
+
+                    # 确保目标父目录存在
                     dest_dir = dest_file.parent
                     if not dest_dir.exists():
                         try:
@@ -259,19 +295,7 @@ class FileCopy2(_PluginBase):
                                 failed_examples.append(f"{file_path} -> 创建目标目录失败: {e}")
                             continue
 
-                    # 如果目标已存在且大小一致，跳过
-                    if dest_file.exists() and self._verify_copy(file_path, dest_file):
-                        logger.info(f"{repr(str(dest_file))} 文件已存在且一致，跳过")
-                        total_skipped += 1
-                        if len(skipped_examples) < 10:
-                            skipped_examples.append(str(dest_file))
-                        continue
-
-                    # 如果目标已存在但大小不一致，记录并尝试覆盖
-                    if dest_file.exists() and not self._verify_copy(file_path, dest_file):
-                        logger.warning(f"目标已存在但大小不一致，将尝试覆盖：{repr(str(dest_file))}")
-
-                    # 优先使用 SystemUtils.copy（保持原接口与行为）
+                    # 执行复制（优先 SystemUtils.copy）
                     copy_ok = False
                     copy_err = ""
                     try:
@@ -283,26 +307,25 @@ class FileCopy2(_PluginBase):
                         copy_err = str(e)
 
                     # 验证复制结果
+                    copy_verified = False
                     if copy_ok and self._verify_copy(file_path, dest_file):
                         logger.info(f"{repr(str(file_path))} -> {repr(str(dest_file))} 成功 (SystemUtils.copy)")
                         total_copied += 1
+                        copy_verified = True
                         if len(copied_examples) < 10:
                             copied_examples.append(str(dest_file))
-                        copy_verified = True
                     else:
-                        # 回退到 shutil.copy2
-                        logger.warning(f"SystemUtils.copy 结果不可验证或失败 (info: {copy_err}), 回退到 shutil.copy2")
+                        logger.warning(f"SystemUtils.copy 失败或不可验证 ({copy_err})，回退到 shutil.copy2")
                         try:
                             shutil.copy2(str(file_path), str(dest_file))
                         except Exception as e:
                             logger.error(f"shutil.copy2 复制失败：{e}")
-                        # 再次验证
                         if self._verify_copy(file_path, dest_file):
                             logger.info(f"{repr(str(file_path))} -> {repr(str(dest_file))} 成功 (shutil.copy2 回退)")
                             total_copied += 1
+                            copy_verified = True
                             if len(copied_examples) < 10:
                                 copied_examples.append(str(dest_file))
-                            copy_verified = True
                         else:
                             src_size2 = -1
                             dst_size2 = -1
@@ -316,11 +339,10 @@ class FileCopy2(_PluginBase):
                                 pass
                             logger.error(f"{repr(str(file_path))} -> {repr(str(dest_file))} 最终复制失败 (src_size={src_size2}, dst_size={dst_size2})")
                             total_failed += 1
-                            copy_verified = False
                             if len(failed_examples) < 10:
                                 failed_examples.append(f"{file_path} -> 最终失败 (src_size={src_size2}, dst_size={dst_size2})")
 
-                    # 如果复制已验证成功并且启用了删除源文件，则删除源文件
+                    # 若复制成功且开启删除源文件，则删除源文件
                     if copy_verified and self._delete_source:
                         try:
                             file_path.unlink()
@@ -330,11 +352,10 @@ class FileCopy2(_PluginBase):
                             logger.info(f"已删除源文件：{repr(str(file_path))}")
                         except Exception as e:
                             logger.error(f"删除源文件失败：{file_path} -> {e}")
-                            # 未把删除失败计为复制失败，保留复制结果，但记录失败示例
                             if len(failed_examples) < 10:
                                 failed_examples.append(f"{file_path} -> 删除失败: {e}")
 
-                    # 随机/批量延时逻辑（保持原配置动态生效）
+                    # 随机/批量延时逻辑（按配置生效）
                     if self._delay:
                         try:
                             cnt += 1
@@ -389,7 +410,6 @@ class FileCopy2(_PluginBase):
                     body_lines += deleted_examples[:10]
 
                 message = "\n".join(body_lines)
-                # 调用基类 post_message 发送通知
                 self.post_message(title=title, mtype=NotificationType.SiteMessage, text=message)
             except Exception as e:
                 logger.error(f"发送通知失败：{e}")
@@ -406,7 +426,8 @@ class FileCopy2(_PluginBase):
             "delay": self._delay,
             "rmt_mediaext": self._rmt_mediaext,
             "notify": self._notify,
-            "delete": self._delete_source
+            "delete": self._delete_source,
+            "preserve_dirs": self._preserve_dirs
         })
 
     def get_state(self) -> bool:
@@ -414,10 +435,10 @@ class FileCopy2(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
@@ -442,7 +463,7 @@ class FileCopy2(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -458,7 +479,7 @@ class FileCopy2(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -474,7 +495,7 @@ class FileCopy2(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -486,6 +507,22 @@ class FileCopy2(_PluginBase):
                                     }
                                 ]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'delete',
+                                            'label': '复制成功后删除源文件',
+                                        }
+                                    }
+                                ]
+                            }
                         ]
                     },
                     {
@@ -535,8 +572,8 @@ class FileCopy2(_PluginBase):
                                     {
                                         'component': 'VSwitch',
                                         'props': {
-                                            'model': 'delete',
-                                            'label': '复制成功后删除源文件',
+                                            'model': 'preserve_dirs',
+                                            'label': '保留子目录结构到目标（开启：保留；关闭：只平铺文件）',
                                         }
                                     }
                                 ]
@@ -558,7 +595,7 @@ class FileCopy2(_PluginBase):
                                             'model': 'monitor_dirs',
                                             'label': '监控目录',
                                             'rows': 5,
-                                            'placeholder': '监控目录:转移目的目录'
+                                            'placeholder': '监控目录:转移目的目录，示例：\\n/pan2/下载/电影/:/pan2/快速上传115/电影/\\n/pan2/下载/电视剧/:/pan2/快速上传115/电视剧/'
                                         }
                                     }
                                 ]
@@ -580,7 +617,7 @@ class FileCopy2(_PluginBase):
                                             'model': 'rmt_mediaext',
                                             'label': '文件格式',
                                             'rows': 2,
-                                            'placeholder': ".nfo, .jpg"
+                                            'placeholder': ".mp4, .mkv, .avi, .ts, .srt, .ass, .ssa, .sub, .idx"
                                         }
                                     }
                                 ]
@@ -595,13 +632,14 @@ class FileCopy2(_PluginBase):
             "monitor_dirs": "",
             "cron": "",
             "delay": "20,1-10",
-            "rmt_mediaext": ".nfo, .jpg",
+            "rmt_mediaext": ".mp4, .mkv, .avi, .ts, .srt, .ass, .ssa, .sub, .idx",
             "notify": True,
-            "delete": False
+            "delete": False,
+            "preserve_dirs": False
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        return []
 
     def stop_service(self):
         """
