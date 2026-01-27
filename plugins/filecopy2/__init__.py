@@ -17,7 +17,6 @@ from app.plugins import _PluginBase
 from app.utils.system import SystemUtils
 from app.schemas.types import NotificationType
 
-# 防止并发执行
 lock = threading.Lock()
 
 
@@ -25,7 +24,7 @@ class FileCopy2(_PluginBase):
     plugin_name = "文件复制（完善版）"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.9"
+    plugin_version = "2.0"
     plugin_author = "LGaoo"
     author_url = "https://github.com/LGaoo"
     plugin_config_prefix = "filecopy2_"
@@ -42,19 +41,21 @@ class FileCopy2(_PluginBase):
 
     _rmt_mediaext = None
 
-    # 可配置项
+    # 可配置项（新增：重试与稳定检测）
     _notify = True
     _delete_source = False
     _preserve_dirs = False
-    _debug = False  # debug 模式：更详细日志（但不写文件）
+    _debug = False
+
+    # 复制稳健检测参数（可在界面存取）
+    _copy_retry_count = 3        # 复制失败重试次数
+    _copy_retry_delay = 1        # 每次重试间隔（秒）
+    _stable_check_seconds = 3    # 验证后等待多少秒保证目标稳定存在再删除源
 
     _event = threading.Event()
 
     def init_plugin(self, config: dict = None):
-        # 重置
         self._dirconf = {}
-
-        # 读取配置
         if config:
             self._enabled = config.get("enabled")
             self._onlyonce = config.get("onlyonce")
@@ -66,6 +67,9 @@ class FileCopy2(_PluginBase):
             self._delete_source = config.get("delete") if config.get("delete") is not None else False
             self._preserve_dirs = config.get("preserve_dirs") if config.get("preserve_dirs") is not None else False
             self._debug = config.get("debug") if config.get("debug") is not None else False
+            self._copy_retry_count = int(config.get("copy_retry_count") or 3)
+            self._copy_retry_delay = int(config.get("copy_retry_delay") or 1)
+            self._stable_check_seconds = int(config.get("stable_check_seconds") or 3)
 
         # 停止旧任务
         self.stop_service()
@@ -79,8 +83,7 @@ class FileCopy2(_PluginBase):
             for mon_path in monitor_dirs:
                 if not mon_path:
                     continue
-
-                # Windows 特殊解析（保持兼容）
+                # Windows 解析兼容
                 if SystemUtils.is_windows():
                     if mon_path.count(":") > 1:
                         parts = mon_path.split(":")
@@ -89,7 +92,6 @@ class FileCopy2(_PluginBase):
                         paths = [mon_path]
                 else:
                     paths = mon_path.split(":")
-
                 if len(paths) > 1:
                     mon_path_key = paths[0].strip()
                     target_path = Path(paths[1].strip())
@@ -98,7 +100,6 @@ class FileCopy2(_PluginBase):
                     mon_path_key = paths[0].strip()
                     self._dirconf[mon_path_key] = None
 
-            # 只注册一个立即触发的 job（copy_files 自行遍历所有监控项）
             if self._enabled:
                 self._scheduler.add_job(func=self.copy_files, trigger='date',
                                         run_date=datetime.datetime.now(
@@ -108,8 +109,7 @@ class FileCopy2(_PluginBase):
                 logger.info(f"文件复制服务启动，立即运行一次 版本{self.plugin_version}")
                 self._scheduler.add_job(name="文件复制", func=self.copy_files, trigger='date',
                                         run_date=datetime.datetime.now(
-                                            tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
-                                        )
+                                            tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3))
                 self._onlyonce = False
                 self.__update_config()
 
@@ -141,8 +141,39 @@ class FileCopy2(_PluginBase):
                 return cand
             i += 1
 
+    def _stable_check(self, dest: Path, expected_size: int, seconds: int) -> bool:
+        """
+        验证目标在接下来的 seconds 内持续存在且大小不变。
+        返回 True 表示稳定。
+        """
+        if not dest.exists():
+            logger.warning(f"稳定检查：目标不存在 {dest}")
+            return False
+        try:
+            prev = dest.stat().st_size
+        except Exception:
+            prev = -1
+        if prev != expected_size:
+            logger.warning(f"稳定检查：目标大小与期望不符 (期望={expected_size}, 实际={prev})")
+            return False
+
+        # 连续检查几次（每秒一次）
+        for i in range(seconds):
+            time.sleep(1)
+            try:
+                if not dest.exists():
+                    logger.warning(f"稳定检查失败：目标在等待期间被移走 {dest}")
+                    return False
+                cur = dest.stat().st_size
+            except Exception as e:
+                logger.warning(f"稳定检查读取 stat 失败：{e}")
+                return False
+            if cur != prev:
+                logger.warning(f"稳定检查失败：目标大小在等待期间发生变化 {prev} -> {cur}")
+                return False
+        return True
+
     def copy_files(self):
-        # 防并发
         got = lock.acquire(blocking=False)
         if not got:
             logger.warning("上一次文件复制任务仍在运行，跳过本次触发")
@@ -170,7 +201,6 @@ class FileCopy2(_PluginBase):
             skipped_examples = []
             deleted_examples = []
 
-            # 遍历每个监控项
             for mon_path, target_path in list(self._dirconf.items()):
                 if not mon_path:
                     continue
@@ -186,7 +216,7 @@ class FileCopy2(_PluginBase):
                     logger.info(f"{repr(str(src_base))} 未配置目标目录，跳过")
                     continue
 
-                # 收集文件（os.walk）
+                # 收集文件
                 files = []
                 roots_sample = []
                 try:
@@ -210,7 +240,6 @@ class FileCopy2(_PluginBase):
                     try:
                         files = SystemUtils.list_files(src_base, exts)
                         files = [Path(x) if not isinstance(x, Path) else x for x in files]
-                        logger.info(f"SystemUtils.list_files 返回数量：{len(files)} (示例前200个: {[str(x) for x in files[:200]]})")
                     except Exception as e2:
                         logger.error(f"回退也失败：{e2}")
                         files = []
@@ -228,18 +257,7 @@ class FileCopy2(_PluginBase):
                 except Exception:
                     pass
 
-                # 打印发现文件（样例）
-                sample_files = [repr(str(x)) for x in files[:500]]
-                logger.info(f"发现文件数量：{len(files)} (示例前500个: {sample_files})")
-                if self._debug:
-                    # 打印更详细：磁盘上实际 stat 信息（仅前200个以防日志爆炸）
-                    for p in files[:200]:
-                        try:
-                            st = p.stat()
-                            logger.info(f"[DEBUG STAT] {p} size={st.st_size} mtime={st.st_mtime} ino={getattr(st,'st_ino',None)} dev={getattr(st,'st_dev',None)}")
-                        except Exception as e:
-                            logger.info(f"[DEBUG STAT] {p} stat failed: {e}")
-
+                logger.info(f"发现文件数量：{len(files)} (示例前20个: {[repr(str(x)) for x in files[:20]]})")
                 total_found += len(files)
 
                 # per-monitor stats
@@ -251,9 +269,9 @@ class FileCopy2(_PluginBase):
                     try:
                         file_path = Path(file_obj) if not isinstance(file_obj, Path) else file_obj
 
-                        # 再次确认文件存在
+                        # 源仍存在检查
                         if not file_path.exists():
-                            logger.warning(f"[EXTERNAL] 源文件在处理前已不存在，跳过：{repr(str(file_path))}")
+                            logger.warning(f"[EXTERNAL] 源文件在处理前已不存在，跳过：{file_path}")
                             item_failed += 1
                             total_failed += 1
                             if len(failed_examples) < 20:
@@ -263,18 +281,12 @@ class FileCopy2(_PluginBase):
                         try:
                             sst = file_path.stat()
                             src_size = sst.st_size
-                            src_mtime = sst.st_mtime
-                            src_ino = getattr(sst, "st_ino", None)
-                            src_dev = getattr(sst, "st_dev", None)
                         except Exception:
                             src_size = -1
-                            src_mtime = None
-                            src_ino = None
-                            src_dev = None
 
-                        logger.info(f"[文件] 处理：{repr(str(file_path))} size={src_size} mtime={src_mtime} ino={src_ino} dev={src_dev}")
+                        logger.info(f"[文件] 处理：{file_path} size={src_size}")
 
-                        # 决定目标路径：保留目录或平铺
+                        # 目标路径
                         if self._preserve_dirs:
                             try:
                                 rel = file_path.relative_to(src_base)
@@ -284,238 +296,187 @@ class FileCopy2(_PluginBase):
                         else:
                             dest_file = tgt_base.joinpath(file_path.name)
 
-                        logger.info(f"[映射] {repr(str(file_path))} -> {repr(str(dest_file))}")
+                        logger.info(f"[映射] {file_path} -> {dest_file}")
 
                         # 目标已存在且一致则跳过
                         if dest_file.exists() and self._verify_copy(file_path, dest_file):
-                            logger.info(f"[跳过] 目标已存在且一致：{repr(str(dest_file))}")
+                            logger.info(f"[跳过] 目标已存在且一致：{dest_file}")
                             item_skipped += 1
                             total_skipped += 1
                             if len(skipped_examples) < 20:
                                 skipped_examples.append(str(dest_file))
                             continue
 
-                        # 平铺模式且冲突则生成唯一目标名
+                        # 平铺冲突处理
                         if not self._preserve_dirs and dest_file.exists() and not self._verify_copy(file_path, dest_file):
                             old_dest = dest_file
                             dest_file = self._make_unique_dest(dest_file)
-                            logger.info(f"[冲突] 目标存在且不一致，使用唯一目标: {repr(str(old_dest))} -> {repr(str(dest_file))}")
+                            logger.info(f"[冲突] 目标存在且不一致，使用唯一目标: {old_dest} -> {dest_file}")
 
-                        # 确保目标目录存在
+                        # 创建目标目录
                         dest_dir = dest_file.parent
                         if not dest_dir.exists():
                             try:
                                 dest_dir.mkdir(parents=True, exist_ok=True)
-                                logger.info(f"创建目标目录：{repr(str(dest_dir))}")
+                                logger.info(f"创建目标目录：{dest_dir}")
                             except Exception as e:
-                                logger.error(f"创建目标目录失败：{repr(str(dest_dir))} -> {e}")
+                                logger.error(f"创建目标目录失败：{dest_dir} -> {e}")
                                 item_failed += 1
                                 total_failed += 1
                                 if len(failed_examples) < 20:
                                     failed_examples.append(f"{file_path} -> 创建目标目录失败: {e}")
                                 continue
 
-                        # 再次确认源存在（防止在此刻被其他进程删除）
-                        if not file_path.exists():
-                            logger.warning(f"[EXTERNAL] 源文件在复制前已不存在：{repr(str(file_path))}")
-                            item_failed += 1
-                            total_failed += 1
-                            if len(failed_examples) < 20:
-                                failed_examples.append(f"{file_path} -> 源文件不存在（复制前）")
-                            continue
-
-                        # 开始复制（优先 SystemUtils.copy -> 回退 shutil.copy2）
-                        copy_verified = False
-                        dest_tmp = dest_file.parent / (dest_file.name + ".part")
-                        try:
-                            if dest_tmp.exists():
-                                try:
-                                    dest_tmp.unlink()
-                                    logger.info(f"移除残留临时文件：{repr(str(dest_tmp))}")
-                                except Exception:
-                                    dest_tmp = dest_file.parent / (dest_file.name + f".part-{int(time.time())}")
-                                    logger.info(f"残留临时文件无法删除，使用时间戳临时文件：{repr(str(dest_tmp))}")
-
-                            syscopy_used = False
-                            sys_state = None
-                            sys_err = None
+                        # 复制重试逻辑（包含稳定检测）
+                        success_final = False
+                        attempt = 0
+                        while attempt <= self._copy_retry_count and not success_final:
+                            attempt += 1
+                            copy_verified = False
+                            dest_tmp = dest_file.parent / (dest_file.name + ".part")
                             try:
-                                logger.info(f"调用 SystemUtils.copy: {repr(str(file_path))} -> {repr(str(dest_tmp))}")
-                                state, error = SystemUtils.copy(file_path, dest_tmp)
-                                syscopy_used = True
-                                sys_state = state
-                                sys_err = error
-                                logger.info(f"SystemUtils.copy 返回: state={state}, error={error}")
-                            except Exception as e_sys:
-                                syscopy_used = False
-                                sys_err = str(e_sys)
-                                logger.warning(f"SystemUtils.copy 调用异常: {e_sys}")
+                                if dest_tmp.exists():
+                                    try:
+                                        dest_tmp.unlink()
+                                        logger.info(f"移除残留临时文件：{dest_tmp}")
+                                    except Exception:
+                                        dest_tmp = dest_file.parent / (dest_file.name + f".part-{int(time.time())}")
+                                        logger.info(f"使用时间戳临时文件：{dest_tmp}")
 
-                            write_ok = False
-                            if syscopy_used and sys_state == 0 and dest_tmp.exists():
-                                # 尝试 fsync
+                                # 尝试 SystemUtils.copy
+                                syscopy_used = False
+                                sys_state = None
+                                sys_err = None
                                 try:
-                                    with open(str(dest_tmp), "rb") as ftmp:
-                                        try:
-                                            os.fsync(ftmp.fileno())
-                                        except Exception as efs:
-                                            logger.debug(f"fsync 临时文件失败（可忽略）：{efs}")
-                                except Exception:
-                                    logger.debug("无法打开 SystemUtils.copy 生成的临时文件以 fsync")
-                                write_ok = True
-                                logger.info("SystemUtils.copy 临时文件写入成功")
-                            else:
-                                # 回退到 shutil.copy2
-                                try:
-                                    logger.info(f"回退到 shutil.copy2: {repr(str(file_path))} -> {repr(str(dest_tmp))} (info: {sys_err})")
-                                    shutil.copy2(str(file_path), str(dest_tmp))
+                                    logger.info(f"[尝试复制] SystemUtils.copy: {file_path} -> {dest_tmp} (attempt={attempt})")
+                                    state, error = SystemUtils.copy(file_path, dest_tmp)
+                                    syscopy_used = True
+                                    sys_state = state
+                                    sys_err = error
+                                    logger.info(f"SystemUtils.copy 返回: state={state}, error={error}")
+                                except Exception as e_sys:
+                                    syscopy_used = False
+                                    sys_err = str(e_sys)
+                                    logger.warning(f"SystemUtils.copy 调用异常: {e_sys}")
+
+                                write_ok = False
+                                if syscopy_used and sys_state == 0 and dest_tmp.exists():
+                                    # fsync 尝试
                                     try:
                                         with open(str(dest_tmp), "rb") as ftmp:
                                             try:
                                                 os.fsync(ftmp.fileno())
                                             except Exception as efs:
-                                                logger.debug(f"fsync 回退临时文件失败（可忽略）：{efs}")
+                                                logger.debug(f"fsync 临时文件失败（可忽略）：{efs}")
                                     except Exception:
-                                        logger.debug("无法打开回退的临时文件以 fsync")
+                                        logger.debug("无法打开 SystemUtils.copy 生成的临时文件以 fsync")
                                     write_ok = True
-                                    logger.info("shutil.copy2 临时文件写入成功")
-                                except Exception as e_shutil:
-                                    write_ok = False
-                                    logger.error(f"shutil.copy2 复制失败：{e_shutil}")
-
-                            if write_ok:
-                                try:
-                                    os.replace(str(dest_tmp), str(dest_file))
-                                    logger.info(f"os.replace 原子替换成功：{repr(str(dest_file))}")
-                                except Exception as erepl:
-                                    logger.error(f"os.replace 原子替换失败：{dest_tmp} -> {dest_file} ({erepl})")
-                                    try:
-                                        if dest_tmp.exists():
-                                            dest_tmp.unlink()
-                                    except Exception:
-                                        pass
-
-                            # 验证目标文件
-                            if dest_file.exists():
-                                try:
-                                    dst_stat = dest_file.stat()
-                                    dst_size = dst_stat.st_size
-                                except Exception:
-                                    dst_size = -1
-                                if src_size >= 0:
-                                    if dst_size == src_size:
-                                        copy_verified = True
-                                        logger.info(f"验证通过：src_size={src_size}, dst_size={dst_size}")
-                                    else:
-                                        logger.error(f"验证失败：src_size={src_size}, dst_size={dst_size} ({file_path} -> {dest_file})")
                                 else:
-                                    if dst_size > 0:
-                                        copy_verified = True
-                                        logger.info(f"验证通过（未知 src_size）: dst_size={dst_size}")
-                                    else:
-                                        logger.error(f"目标文件大小为0，视为复制失败：{dest_file}")
-                            else:
-                                logger.error(f"目标文件不存在，复制失败：{dest_file}")
+                                    # 回退到 shutil.copy2
+                                    try:
+                                        logger.info(f"[回退] shutil.copy2: {file_path} -> {dest_tmp} (info: {sys_err})")
+                                        shutil.copy2(str(file_path), str(dest_tmp))
+                                        try:
+                                            with open(str(dest_tmp), "rb") as ftmp:
+                                                try:
+                                                    os.fsync(ftmp.fileno())
+                                                except Exception as efs:
+                                                    logger.debug(f"fsync 回退临时文件失败（可忽略）：{efs}")
+                                        except Exception:
+                                            logger.debug("无法打开回退的临时文件以 fsync")
+                                        write_ok = True
+                                    except Exception as e_shutil:
+                                        write_ok = False
+                                        logger.error(f"shutil.copy2 复制失败：{e_shutil}")
 
-                            if not copy_verified:
+                                if write_ok:
+                                    try:
+                                        os.replace(str(dest_tmp), str(dest_file))
+                                        logger.info(f"os.replace 原子替换成功：{dest_file} (attempt={attempt})")
+                                    except Exception as erepl:
+                                        logger.error(f"os.replace 原子替换失败：{dest_tmp} -> {dest_file} ({erepl})")
+                                        try:
+                                            if dest_tmp.exists():
+                                                dest_tmp.unlink()
+                                        except Exception:
+                                            pass
+
+                                # 基本验证（大小）
+                                if dest_file.exists():
+                                    try:
+                                        dst_size = dest_file.stat().st_size
+                                    except Exception:
+                                        dst_size = -1
+                                    if src_size >= 0 and dst_size == src_size:
+                                        logger.info(f"基本验证通过：src_size={src_size}, dst_size={dst_size} (attempt={attempt})")
+                                        # 进行稳定检测：确保目标在接下来的 seconds 内稳定存在且大小不变
+                                        stable_ok = self._stable_check(dest_file, src_size, self._stable_check_seconds)
+                                        if stable_ok:
+                                            copy_verified = True
+                                            logger.info(f"稳定检测通过，文件持久存在：{dest_file}")
+                                        else:
+                                            copy_verified = False
+                                            logger.warning(f"稳定检测未通过 (attempt={attempt})，目标可能被外部程序移动/删除")
+                                    else:
+                                        logger.error(f"基本验证失败：src_size={src_size}, dst_size={dst_size} (attempt={attempt})")
+                                        copy_verified = False
+                                else:
+                                    logger.error(f"目标文件不存在，复制失败 (attempt={attempt})")
+                                    copy_verified = False
+
+                            except Exception as e_outer:
+                                logger.error(f"复制过程中异常 (attempt={attempt}): {e_outer}")
                                 try:
-                                    if dest_tmp.exists():
+                                    if 'dest_tmp' in locals() and dest_tmp.exists():
                                         dest_tmp.unlink()
-                                        logger.info(f"清理残留临时文件：{repr(str(dest_tmp))}")
                                 except Exception:
                                     pass
-                        except Exception as e_outer:
-                            logger.error(f"复制过程中异常：{e_outer}")
-                            try:
-                                if 'dest_tmp' in locals() and dest_tmp.exists():
-                                    dest_tmp.unlink()
-                            except Exception:
-                                pass
-                            copy_verified = False
+                                copy_verified = False
 
-                        # 删除前的严格检查（大小一致 + 非同 inode + 目标 mtime >= 源 mtime）
-                        if copy_verified and self._delete_source:
-                            try:
-                                if not dest_file.exists():
-                                    logger.error(f"目标在删除前不存在，跳过删除：{dest_file}")
-                                else:
-                                    try:
-                                        dst_stat = dest_file.stat()
-                                    except Exception:
-                                        dst_stat = None
-                                    try:
-                                        src_stat2 = file_path.stat()
-                                    except Exception:
-                                        src_stat2 = None
+                            if copy_verified:
+                                success_final = True
+                                break
+                            else:
+                                logger.warning(f"复制未成功（attempt={attempt}/{self._copy_retry_count}），延时 {self._copy_retry_delay} 秒后重试")
+                                time.sleep(self._copy_retry_delay)
 
-                                    safe_to_delete = False
-                                    if src_stat2 and dst_stat:
-                                        if src_stat2.st_size == dst_stat.st_size:
-                                            same_file = False
-                                            try:
-                                                same_file = (hasattr(src_stat2, "st_ino") and hasattr(dst_stat, "st_ino") and
-                                                             src_stat2.st_ino == dst_stat.st_ino and src_stat2.st_dev == dst_stat.st_dev)
-                                            except Exception:
-                                                same_file = False
-                                            if same_file:
-                                                logger.warning(f"源和目标为同一底层文件，跳过删除：{file_path} -> {dest_file}")
-                                                safe_to_delete = False
-                                            else:
-                                                try:
-                                                    if dst_stat.st_mtime >= src_stat2.st_mtime:
-                                                        safe_to_delete = True
-                                                    else:
-                                                        logger.warning(f"目标 mtime 早于源 mtime，跳过删除：dst_mtime={dst_stat.st_mtime}, src_mtime={src_stat2.st_mtime}")
-                                                        safe_to_delete = False
-                                                except Exception:
-                                                    safe_to_delete = True
-                                        else:
-                                            logger.error(f"目标大小与源不一致，跳过删除：src={src_stat2.st_size if src_stat2 else 'N/A'}, dst={dst_stat.st_size if dst_stat else 'N/A'}")
-                                            safe_to_delete = False
-                                    else:
-                                        logger.warning("无法获取 src/dst stat，跳过删除以保证安全")
-                                        safe_to_delete = False
-
-                                    if safe_to_delete:
-                                        if file_path.exists():
-                                            try:
-                                                file_path.unlink()
-                                                item_deleted += 1
-                                                total_deleted += 1
-                                                if len(deleted_examples) < 20:
-                                                    deleted_examples.append(str(file_path))
-                                                logger.info(f"已删除源文件（确认复制成功后）：{repr(str(file_path))}")
-                                            except Exception as edelete:
-                                                logger.error(f"删除源文件失败：{file_path} -> {edelete}")
-                                                if len(failed_examples) < 20:
-                                                    failed_examples.append(f"{file_path} -> 删除失败: {edelete}")
-                                        else:
-                                            logger.warning(f"欲删除的源文件已不存在（跳过删除）：{repr(str(file_path))}")
-                                    else:
-                                        logger.warning(f"删除条件不满足，跳过删除：{file_path} -> {dest_file}")
-                            except Exception as e_check_del:
-                                logger.error(f"删除前检查异常：{e_check_del}")
-
-                        # 统计
-                        if copy_verified:
+                        # 结束重试循环
+                        if success_final:
+                            logger.info(f"最终复制成功：{file_path} -> {dest_file}")
                             item_copied += 1
                             total_copied += 1
                             if len(copied_examples) < 20:
                                 copied_examples.append(str(dest_file))
+
+                            # 仅在成功且 delete 开启时才尝试删除源（已通过稳定检查）
+                            if self._delete_source:
+                                try:
+                                    if file_path.exists():
+                                        file_path.unlink()
+                                        item_deleted += 1
+                                        total_deleted += 1
+                                        if len(deleted_examples) < 20:
+                                            deleted_examples.append(str(file_path))
+                                        logger.info(f"已删除源文件（确认复制成功后）：{file_path}")
+                                except Exception as edelete:
+                                    logger.error(f"删除源文件失败：{file_path} -> {edelete}")
+                                    if len(failed_examples) < 20:
+                                        failed_examples.append(f"{file_path} -> 删除失败: {edelete}")
                         else:
+                            logger.error(f"所有重试均失败，保留源文件：{file_path}")
                             item_failed += 1
                             total_failed += 1
                             if len(failed_examples) < 20:
-                                failed_examples.append(f"{file_path} -> 复制失败")
+                                failed_examples.append(f"{file_path} -> 最终复制失败")
 
                     except Exception as ex:
-                        logger.error(f"处理文件 {repr(str(file_obj))} 时异常：{ex}")
+                        logger.error(f"处理文件 {file_obj} 时异常：{ex}")
                         item_failed += 1
                         total_failed += 1
                         if len(failed_examples) < 20:
                             failed_examples.append(f"{file_obj} -> 异常: {ex}")
 
-                    # 批量延时逻辑
+                    # 批量延时逻辑（保持原有）
                     if self._delay:
                         try:
                             cnt += 1
@@ -534,10 +495,10 @@ class FileCopy2(_PluginBase):
                             logger.error(f"处理延时配置出错：{e}")
 
                 # 单项结束日志
-                logger.info(f"==== 结束监控项: {repr(str(src_base))} -> {repr(str(tgt_base))} ====")
+                logger.info(f"==== 结束监控项: {src_base} -> {tgt_base} ====")
                 logger.info(f"本项统计: 发现={item_found}, 成功={item_copied}, 跳过={item_skipped}, 失败={item_failed}, 删除={item_deleted}")
 
-            # 发送通知（若启用）
+            # 发送通知
             if self._notify:
                 try:
                     title = "【文件复制任务完成】"
@@ -585,7 +546,10 @@ class FileCopy2(_PluginBase):
             "notify": self._notify,
             "delete": self._delete_source,
             "preserve_dirs": self._preserve_dirs,
-            "debug": self._debug
+            "debug": self._debug,
+            "copy_retry_count": self._copy_retry_count,
+            "copy_retry_delay": self._copy_retry_delay,
+            "stable_check_seconds": self._stable_check_seconds
         })
 
     def get_state(self) -> bool:
@@ -613,6 +577,7 @@ class FileCopy2(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
+                    # 布局（保留并增加新配置项）
                     {
                         'component': 'VRow',
                         'content': [
@@ -645,6 +610,14 @@ class FileCopy2(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VTextField', 'props': {'model': 'copy_retry_count', 'label': '复制重试次数'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VTextField', 'props': {'model': 'copy_retry_delay', 'label': '重试间隔（秒）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VTextField', 'props': {'model': 'stable_check_seconds', 'label': '稳定检测秒数'}}]}
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
                             {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VSwitch', 'props': {'model': 'debug', 'label': '调试模式（打印更详细日志）'}}]}
                         ]
                     }
@@ -660,7 +633,10 @@ class FileCopy2(_PluginBase):
             "notify": True,
             "delete": False,
             "preserve_dirs": False,
-            "debug": False
+            "debug": False,
+            "copy_retry_count": 3,
+            "copy_retry_delay": 1,
+            "stable_check_seconds": 3
         }
 
     def get_page(self) -> List[dict]:
