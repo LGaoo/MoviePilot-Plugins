@@ -26,7 +26,7 @@ class FileCopy2(_PluginBase):
     plugin_name = "文件复制（完善版）"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.2"
+    plugin_version = "1.5"
     plugin_author = "LGaoo"
     author_url = "https://github.com/LGaoo"
     plugin_config_prefix = "filecopy2_"
@@ -106,7 +106,7 @@ class FileCopy2(_PluginBase):
 
             # 立即运行一次
             if self._onlyonce:
-                logger.info("文件复制服务启动，立即运行一次")
+                logger.info("文件复制服务启动，立即运行一次 版本1.5")
                 self._scheduler.add_job(name="文件复制", func=self.copy_files, trigger='date',
                                         run_date=datetime.datetime.now(
                                             tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
