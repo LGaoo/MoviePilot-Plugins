@@ -3,7 +3,7 @@
         "name": "文件复制（完善版）",
 	    "description": "自定义文件类型从源目录复制到目的目录。",
 	    "labels": "工具",
-	    "version": "1.8",
+	    "version": "1.9",
 	    "icon": "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png",
 	    "author": "LGaoo",
 	    "level": 1,
