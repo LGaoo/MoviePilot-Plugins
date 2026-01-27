@@ -15,18 +15,17 @@ from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.system import SystemUtils
-from app.schemas.types import NotificationType  # 用于发送通知
+from app.schemas.types import NotificationType
 
 # 模块级锁，防止并发执行 copy_files
 lock = threading.Lock()
 
 
 class FileCopy2(_PluginBase):
-    # 插件元信息
     plugin_name = "文件复制（完善版）"
     plugin_desc = "自定义文件类型从源目录复制到目的目录。"
     plugin_icon = "https://raw.githubusercontent.com/LGaoo/MoviePilot-Plugins/main/icons/copy_files.png"
-    plugin_version = "1.5"
+    plugin_version = "1.6"
     plugin_author = "LGaoo"
     author_url = "https://github.com/LGaoo"
     plugin_config_prefix = "filecopy2_"
@@ -52,7 +51,7 @@ class FileCopy2(_PluginBase):
     _event = threading.Event()
 
     def init_plugin(self, config: dict = None):
-        # 清空配置
+        # 清空目录配置
         self._dirconf = {}
 
         # 读取配置（包含 notify/delete/preserve_dirs）
@@ -67,20 +66,22 @@ class FileCopy2(_PluginBase):
             self._delete_source = config.get("delete") if config.get("delete") is not None else False
             self._preserve_dirs = config.get("preserve_dirs") if config.get("preserve_dirs") is not None else False
 
-        # 停止现有任务
+        # 停止现有任务以便重启
         self.stop_service()
 
         if self._enabled or self._onlyonce:
             # 定时服务管理器
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
-            # 构建 _dirconf（不要在循环中注册 job）
+            # 读取并解析监控目录配置（一次性构建 _dirconf）
             monitor_dirs = self._monitor_dirs.split("\n")
             if not monitor_dirs:
                 return
             for mon_path in monitor_dirs:
                 if not mon_path:
                     continue
+
+                # Windows 路径特殊解析（保持与原版兼容）
                 if SystemUtils.is_windows():
                     if mon_path.count(":") > 1:
                         parts = mon_path.split(":")
@@ -89,6 +90,7 @@ class FileCopy2(_PluginBase):
                         paths = [mon_path]
                 else:
                     paths = mon_path.split(":")
+
                 if len(paths) > 1:
                     mon_path_key = paths[0].strip()
                     target_path = Path(paths[1].strip())
@@ -103,10 +105,9 @@ class FileCopy2(_PluginBase):
                                         run_date=datetime.datetime.now(
                                             tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3),
                                         name=f"文件复制")
-
-            # 立即运行一次
+            # 如果 onlyonce，则注册一次性执行并保存配置
             if self._onlyonce:
-                logger.info("文件复制服务启动，立即运行一次 版本1.5")
+                logger.info(f"文件复制服务启动，立即运行一次 版本{self.plugin_version}")
                 self._scheduler.add_job(name="文件复制", func=self.copy_files, trigger='date',
                                         run_date=datetime.datetime.now(
                                             tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
@@ -153,6 +154,7 @@ class FileCopy2(_PluginBase):
         """
         主任务：遍历、复制、校验、可选删除源、可选通知。
         使用临时文件 + os.replace 实现原子写入并尽力 fsync 确保落盘。
+        在重要日志中打印当前插件版本号，便于排障。
         """
         # 防止并发运行
         got = lock.acquire(blocking=False)
@@ -160,8 +162,7 @@ class FileCopy2(_PluginBase):
             logger.warning("上一次文件复制任务仍在运行，跳过本次触发")
             return
         try:
-            logger.info("开始全量复制监控目录（preserve_dirs=%s, notify=%s, delete=%s）..." %
-                        (str(self._preserve_dirs), str(self._notify), str(self._delete_source)))
+            logger.info(f"开始全量复制监控目录（preserve_dirs={self._preserve_dirs}, notify={self._notify}, delete={self._delete_source}） 版本{self.plugin_version}")
 
             # 解析扩展名（标准化）
             exts = []
@@ -249,7 +250,7 @@ class FileCopy2(_PluginBase):
                     try:
                         file_path = Path(file_obj) if not isinstance(file_obj, Path) else file_obj
 
-                        # 再次检查源文件是否存在
+                        # 再次检查源文件是否存在（防止在扫描到与处理之间被移走）
                         if not file_path.exists():
                             logger.warning(f"源文件在处理前已不存在，跳过：{repr(str(file_path))}")
                             total_failed += 1
@@ -263,7 +264,7 @@ class FileCopy2(_PluginBase):
                             src_size = -1
                         logger.info(f"开始处理本地文件：{repr(str(file_path))} (大小: {src_size})")
 
-                        # 目标路径决定：保留目录 or 平铺
+                        # 目标路径决定（保留目录 or 平铺）
                         if self._preserve_dirs:
                             try:
                                 relative = file_path.relative_to(src_base)
@@ -299,7 +300,7 @@ class FileCopy2(_PluginBase):
                                     failed_examples.append(f"{file_path} -> 创建目标目录失败: {e}")
                                 continue
 
-                        # 再次确认源存在（防止在准备期间被移动）
+                        # 在调用复制步骤前再次确认源仍存在
                         if not file_path.exists():
                             logger.warning(f"源文件在复制前已不存在，跳过：{repr(str(file_path))}")
                             total_failed += 1
@@ -316,21 +317,17 @@ class FileCopy2(_PluginBase):
                             except Exception:
                                 src_size_before = -1
 
-                            # 临时文件（放在目标目录同一挂载点）
                             dest_tmp = dest_file.parent / (dest_file.name + ".part")
                             if dest_tmp.exists():
                                 try:
                                     dest_tmp.unlink()
                                     logger.info(f"移除残留临时文件：{repr(str(dest_tmp))}")
                                 except Exception:
-                                    # 无法移除则使用带时间戳的临时名
                                     dest_tmp = dest_file.parent / (dest_file.name + f".part-{int(time.time())}")
 
                             write_ok = False
                             try:
-                                # 使用 shutil.copy2 写入临时文件（保持元数据）
                                 shutil.copy2(str(file_path), str(dest_tmp))
-
                                 # 尽力 fsync
                                 try:
                                     with open(str(dest_tmp), "rb") as ftmp:
@@ -340,7 +337,6 @@ class FileCopy2(_PluginBase):
                                             logger.debug(f"fsync 临时文件失败（可忽略）：{efs}")
                                 except Exception:
                                     logger.debug("无法打开临时复制文件以 fsync")
-
                                 write_ok = True
                             except Exception as e:
                                 write_ok = False
@@ -348,11 +344,9 @@ class FileCopy2(_PluginBase):
 
                             if write_ok:
                                 try:
-                                    # 原子替换到目标文件名
                                     os.replace(str(dest_tmp), str(dest_file))
                                 except Exception as erepl:
                                     logger.error(f"os.replace 原子替换失败：{dest_tmp} -> {dest_file} ({erepl})")
-                                    # 清理临时文件
                                     try:
                                         if dest_tmp.exists():
                                             dest_tmp.unlink()
@@ -401,47 +395,78 @@ class FileCopy2(_PluginBase):
 
                         # ------------------ 复制结束 ------------------
 
-                        # 只有复制验证成功才计为成功并可删除源（删除前再做确认）
+                        # 严格删除前检查（确保安全）：大小匹配 + 非同一 inode + 目标 mtime >= 源 mtime
+                        if copy_verified and self._delete_source:
+                            try:
+                                if not dest_file.exists():
+                                    logger.error(f"目标在删除前已不存在，跳过删除：{dest_file}")
+                                else:
+                                    try:
+                                        dst_stat = dest_file.stat()
+                                    except Exception:
+                                        dst_stat = None
+                                    try:
+                                        src_stat = file_path.stat()
+                                    except Exception:
+                                        src_stat = None
+
+                                    safe_to_delete = False
+                                    if src_stat and dst_stat:
+                                        if src_stat.st_size == dst_stat.st_size:
+                                            same_file = False
+                                            try:
+                                                same_file = (hasattr(src_stat, "st_ino") and hasattr(dst_stat, "st_ino") and
+                                                             src_stat.st_ino == dst_stat.st_ino and src_stat.st_dev == dst_stat.st_dev)
+                                            except Exception:
+                                                same_file = False
+                                            if same_file:
+                                                logger.warning(f"源和目标为同一底层文件，跳过删除：{file_path} -> {dest_file}")
+                                                safe_to_delete = False
+                                            else:
+                                                try:
+                                                    if dst_stat.st_mtime >= src_stat.st_mtime:
+                                                        safe_to_delete = True
+                                                    else:
+                                                        logger.warning(f"目标文件时间比源早，跳过删除：dst_mtime={dst_stat.st_mtime}, src_mtime={src_stat.st_mtime}")
+                                                        safe_to_delete = False
+                                                except Exception:
+                                                    safe_to_delete = True
+                                        else:
+                                            logger.error(f"目标大小与源不一致，跳过删除：src={src_stat.st_size if src_stat else 'N/A'}, dst={dst_stat.st_size if dst_stat else 'N/A'}")
+                                            safe_to_delete = False
+                                    else:
+                                        logger.warning("无法获取 src/dst stat，跳过删除以保证安全")
+                                        safe_to_delete = False
+
+                                    if safe_to_delete:
+                                        if file_path.exists():
+                                            try:
+                                                file_path.unlink()
+                                                total_deleted += 1
+                                                if len(deleted_examples) < 10:
+                                                    deleted_examples.append(str(file_path))
+                                                logger.info(f"已删除源文件（确认复制成功后）：{repr(str(file_path))}")
+                                            except Exception as edelete:
+                                                logger.error(f"删除源文件失败：{file_path} -> {edelete}")
+                                                if len(failed_examples) < 10:
+                                                    failed_examples.append(f"{file_path} -> 删除失败: {edelete}")
+                                        else:
+                                            logger.warning(f"欲删除的源文件已不存在（跳过删除）：{repr(str(file_path))}")
+                                    else:
+                                        logger.warning(f"删除条件不满足，跳过删除：{file_path} -> {dest_file}")
+                            except Exception as e_check_del:
+                                logger.error(f"删除前检查异常：{e_check_del}")
+
+                        # 统计复制成功/失败
                         if copy_verified:
                             total_copied += 1
                             if len(copied_examples) < 10:
                                 copied_examples.append(str(dest_file))
-
-                            if self._delete_source:
-                                try:
-                                    # 再次确认目标大小与源一致（最终安全检查）
-                                    try:
-                                        dst_size_final = dest_file.stat().st_size
-                                    except Exception:
-                                        dst_size_final = -1
-
-                                    safe_to_delete = False
-                                    if src_size_before > 0:
-                                        if dst_size_final == src_size_before:
-                                            safe_to_delete = True
-                                    else:
-                                        if dst_size_final > 0:
-                                            safe_to_delete = True
-
-                                    if safe_to_delete:
-                                        if file_path.exists():
-                                            file_path.unlink()
-                                            total_deleted += 1
-                                            if len(deleted_examples) < 10:
-                                                deleted_examples.append(str(file_path))
-                                            logger.info(f"已删除源文件（确认复制成功后）：{repr(str(file_path))}")
-                                        else:
-                                            logger.warning(f"计划删除的源文件已不存在（跳过删除）：{repr(str(file_path))}")
-                                    else:
-                                        logger.error(f"复制结果不安全，跳过删除源文件：{file_path} -> {dest_file} (src_size={src_size_before}, dst_size={dst_size_final})")
-                                except Exception as edelete:
-                                    logger.error(f"删除源文件失败：{file_path} -> {edelete}")
-                                    if len(failed_examples) < 10:
-                                        failed_examples.append(f"{file_path} -> 删除失败: {edelete}")
                         else:
                             total_failed += 1
                             if len(failed_examples) < 10:
                                 failed_examples.append(f"{file_path} -> 复制失败")
+
                     except Exception as ex:
                         logger.error(f"处理文件 {repr(str(file_obj))} 时异常：{ex}")
                         total_failed += 1
@@ -466,12 +491,7 @@ class FileCopy2(_PluginBase):
                         except Exception as e:
                             logger.error(f"处理延时配置出错：{e}")
 
-            # 本次监控项处理结束，继续下一个
-            logger.info("单个监控项处理完成。")
-            # end for mon_path
-            # 继续下一监控目录
-
-            # （注意：total_* 是跨所有监控项累计的）
+                logger.info("单个监控项处理完成。")
 
             # 发送通知（若启用）
             if self._notify:
@@ -502,12 +522,11 @@ class FileCopy2(_PluginBase):
                         body_lines += deleted_examples[:10]
 
                     message = "\n".join(body_lines)
-                    # 发送通知
                     self.post_message(title=title, mtype=NotificationType.SiteMessage, text=message)
                 except Exception as e:
                     logger.error(f"发送通知失败：{e}")
 
-            logger.info("全量复制监控目录完成！")
+            logger.info(f"全量复制监控目录完成！ 版本{self.plugin_version}")
         finally:
             lock.release()
 
@@ -527,8 +546,7 @@ class FileCopy2(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
+    def get_command(self) -> List[Dict[str, Any]]:
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
